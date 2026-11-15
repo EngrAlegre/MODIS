@@ -33,11 +33,11 @@ def _app_version(settings):
 def _probe_harmonized(settings):
     """Open one harmonized partition (latest year, first file). (ok, detail)."""
     try:
-        import glob
+        from pathlib import Path
         from firecal.duck import connect
         from firecal.dataset import processed_root
-        root = os.path.join(str(processed_root(settings)), "harmonized_daily")
-        cand = glob.glob(os.path.join(root, "region=*", "year=*", "*.parquet"))
+        root = Path(processed_root(settings)) / "harmonized_daily"
+        cand = [str(p) for p in root.rglob("*.parquet")]
         if not cand:
             return False, f"no harmonized partitions found in {root}"
         def _y(p):
@@ -47,7 +47,6 @@ def _probe_harmonized(settings):
                 return -1
         cand.sort(key=lambda p: (_y(p), p))
         pick = cand[-1]
-        rel = os.path.relpath(pick, settings.DATA_PROCESSED)
         con = connect(settings, "web")
         try:
             con.execute(f"SELECT COUNT(*) FROM read_parquet('{pick.replace(os.sep, '/')}')").fetchone()
@@ -75,7 +74,7 @@ _ensure_data_status = {}
 
 
 def _ensure_data(settings):
-    """Ensure data/processed has harmonized partitions; auto-download/extract if deployed on cloud."""
+    """Ensure harmonized partitions exist; auto-download/extract to /tmp if needed."""
     global _ensure_data_status
     try:
         from pathlib import Path
@@ -86,80 +85,74 @@ def _ensure_data(settings):
         import zipfile
         from firecal.dataset import processed_root
 
+        # 1. First check: does current DATA_PROCESSED have harmonized partitions?
         root = processed_root(settings)
-        harm_dir = root / "harmonized_daily"
-
-        # 1. Quick check: do partitions exist and are readable right now?
-        cand = glob.glob(str(harm_dir / "region=*" / "year=*" / "*.parquet"))
+        cand = list(root.rglob("data_0.parquet"))
         if cand:
             _ensure_data_status = {"ok": True, "count": len(cand), "path": str(root)}
             return True
 
-        # 2. Try chmod -R 777 on Linux to unlock any 0000 mode directories
+        # 2. Try chmod -R 777 on current root in case of permission locks
         if os.name != "nt":
             try:
                 subprocess.run(["chmod", "-R", "777", str(root)], capture_output=True)
             except Exception:
                 pass
-            cand = glob.glob(str(harm_dir / "region=*" / "year=*" / "*.parquet"))
+            cand = list(root.rglob("data_0.parquet"))
             if cand:
                 _ensure_data_status = {"ok": True, "count": len(cand), "path": str(root)}
                 return True
 
-        # 3. Determine target extraction directory: if root is unwritable, fallback to /tmp
-        target_dir = root
-        can_write_root = False
-        try:
-            root.mkdir(parents=True, exist_ok=True)
-            test_file = root / ".write_test"
-            test_file.write_text("ok")
-            test_file.unlink()
-            can_write_root = True
-        except Exception:
-            pass
+        # 3. Always use a clean dedicated directory in /tmp on Linux
+        target_dir = Path("/tmp/firecal_data") if os.name != "nt" else Path("data/processed")
+        target_dir.mkdir(parents=True, exist_ok=True)
 
-        if not can_write_root:
-            target_dir = Path("/tmp/firecal_data/processed") if os.name != "nt" else root
-            target_dir.mkdir(parents=True, exist_ok=True)
-            settings.DATA_PROCESSED = str(target_dir)
-
-        # 4. Find or download processed_data.zip
-        zip_candidates = [
-            Path("/tmp/processed_data.zip"),
-            Path("data.zip"),
-            Path("processed_data.zip"),
-            root.parent / "data.zip",
-            root.parent / "processed_data.zip",
-        ]
-        zip_path = next((p for p in zip_candidates if p.exists() and p.stat().st_size > 10000), None)
-
-        if zip_path is None:
-            dl_path = Path("/tmp/processed_data.zip") if os.name != "nt" else Path("temp_data.zip")
+        # Check if /tmp/firecal_data already has partitions
+        cand = list(target_dir.rglob("data_0.parquet"))
+        if not cand:
+            # Download official release archive directly
+            dl_path = Path("/tmp/official_processed_data.zip") if os.name != "nt" else Path("temp_data.zip")
             url = "https://github.com/leon-pscl/4-bcc-nasa/releases/download/v1.0.0/processed_data.zip"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
             with urllib.request.urlopen(req) as resp, open(dl_path, "wb") as out:
                 shutil.copyfileobj(resp, out)
-            zip_path = dl_path
 
-        # 5. Extract all files into target_dir
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(str(target_dir))
+            # Extract into target_dir
+            with zipfile.ZipFile(dl_path, "r") as z:
+                z.extractall(str(target_dir))
 
-        if os.name != "nt":
-            try:
-                subprocess.run(["chmod", "-R", "777", str(target_dir)], capture_output=True)
-            except Exception:
-                pass
+            if os.name != "nt":
+                try:
+                    subprocess.run(["chmod", "-R", "777", str(target_dir)], capture_output=True)
+                except Exception:
+                    pass
 
-        # 6. Verify partitions
-        harm_dir = target_dir / "harmonized_daily"
-        cand = glob.glob(str(harm_dir / "region=*" / "year=*" / "*.parquet"))
+        # 4. Find the directory containing harmonized_daily
+        cand = list(target_dir.rglob("data_0.parquet"))
         if cand:
-            settings.DATA_PROCESSED = str(target_dir)
-            _ensure_data_status = {"ok": True, "count": len(cand), "path": str(target_dir)}
+            # Find the root that contains harmonized_daily
+            for p in cand:
+                parts = p.parts
+                if "harmonized_daily" in parts:
+                    idx = parts.index("harmonized_daily")
+                    resolved_data_dir = Path(*parts[:idx])
+                    settings.DATA_PROCESSED = str(resolved_data_dir)
+                    break
+            _ensure_data_status = {
+                "ok": True,
+                "count": len(cand),
+                "path": settings.DATA_PROCESSED,
+                "sample": str(cand[0])
+            }
             return True
         else:
-            _ensure_data_status = {"ok": False, "error": "extraction produced 0 partitions", "path": str(target_dir)}
+            all_found = [str(p) for p in target_dir.rglob("*")][:15]
+            _ensure_data_status = {
+                "ok": False,
+                "error": "0 parquet files found in target_dir",
+                "path": str(target_dir),
+                "contents": all_found
+            }
             return False
     except Exception as exc:
         import logging
