@@ -71,6 +71,75 @@ def _cache_key(args, dv):
     return (tuple(sorted(args.items())), dv)
 
 
+def _ensure_data(settings):
+    """Ensure data/processed has harmonized partitions; auto-download/extract if deployed on cloud."""
+    try:
+        from pathlib import Path
+        import glob
+        from firecal.dataset import processed_root
+        root = processed_root(settings)
+        root.mkdir(parents=True, exist_ok=True)
+        # 1. Fix any broken/0000 directory permissions from previous failed unzips
+        for dirpath, dirnames, filenames in os.walk(str(root)):
+            try:
+                os.chmod(dirpath, 0o755)
+            except Exception:
+                pass
+            for f in filenames:
+                try:
+                    os.chmod(os.path.join(dirpath, f), 0o644)
+                except Exception:
+                    pass
+
+        # 2. Check if harmonized partitions exist
+        harm_dir = root / "harmonized_daily"
+        cand = glob.glob(str(harm_dir / "region=*" / "year=*" / "*.parquet"))
+        if cand:
+            return True
+
+        # 3. Look for existing local data zip or download from release
+        zip_candidates = [Path("data.zip"), Path("processed_data.zip"),
+                          root.parent / "data.zip", root.parent / "processed_data.zip"]
+        zip_path = next((p for p in zip_candidates if p.exists() and p.stat().st_size > 1000), None)
+        if zip_path is None:
+            import urllib.request
+            zip_path = root / "temp_data.zip"
+            url = "https://github.com/leon-pscl/4-bcc-nasa/releases/download/v1.0.0/processed_data.zip"
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
+            with urllib.request.urlopen(req) as resp, open(zip_path, "wb") as out:
+                import shutil
+                shutil.copyfileobj(resp, out)
+
+        import zipfile, shutil
+        with zipfile.ZipFile(zip_path, "r") as z:
+            for member in z.infolist():
+                target = root / member.filename
+                if member.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    try:
+                        target.chmod(0o755)
+                    except Exception:
+                        pass
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with z.open(member) as s, open(target, "wb") as t:
+                        shutil.copyfileobj(s, t)
+                    try:
+                        target.chmod(0o644)
+                    except Exception:
+                        pass
+        if zip_path.name == "temp_data.zip" and zip_path.exists():
+            try:
+                zip_path.unlink()
+            except OSError:
+                pass
+        return True
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("ensure_data error: %s", exc)
+        return False
+
+
 def create_app(settings=None, dist_dir=None):
     _repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if dist_dir is None:
@@ -78,6 +147,7 @@ def create_app(settings=None, dist_dir=None):
     if settings is None:
         from firecal.config import Settings
         settings = Settings.from_env()
+    _ensure_data(settings)
     from flask import Flask
     app = Flask(__name__)
     app.debug = os.environ.get("FLASK_DEBUG", "0") == "1"  # default off; never the network debugger
