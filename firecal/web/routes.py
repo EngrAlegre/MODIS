@@ -71,72 +71,100 @@ def _cache_key(args, dv):
     return (tuple(sorted(args.items())), dv)
 
 
+_ensure_data_status = {}
+
+
 def _ensure_data(settings):
     """Ensure data/processed has harmonized partitions; auto-download/extract if deployed on cloud."""
+    global _ensure_data_status
     try:
         from pathlib import Path
         import glob
+        import shutil
+        import subprocess
+        import urllib.request
+        import zipfile
         from firecal.dataset import processed_root
-        root = processed_root(settings)
-        root.mkdir(parents=True, exist_ok=True)
-        # 1. Fix any broken/0000 directory permissions from previous failed unzips
-        for dirpath, dirnames, filenames in os.walk(str(root)):
-            try:
-                os.chmod(dirpath, 0o755)
-            except Exception:
-                pass
-            for f in filenames:
-                try:
-                    os.chmod(os.path.join(dirpath, f), 0o644)
-                except Exception:
-                    pass
 
-        # 2. Check if harmonized partitions exist
+        root = processed_root(settings)
         harm_dir = root / "harmonized_daily"
+
+        # 1. Quick check: do partitions exist and are readable right now?
         cand = glob.glob(str(harm_dir / "region=*" / "year=*" / "*.parquet"))
         if cand:
+            _ensure_data_status = {"ok": True, "count": len(cand), "path": str(root)}
             return True
 
-        # 3. Look for existing local data zip or download from release
-        zip_candidates = [Path("data.zip"), Path("processed_data.zip"),
-                          root.parent / "data.zip", root.parent / "processed_data.zip"]
-        zip_path = next((p for p in zip_candidates if p.exists() and p.stat().st_size > 1000), None)
-        if zip_path is None:
-            import urllib.request
-            zip_path = root / "temp_data.zip"
-            url = "https://github.com/leon-pscl/4-bcc-nasa/releases/download/v1.0.0/processed_data.zip"
-            req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
-            with urllib.request.urlopen(req) as resp, open(zip_path, "wb") as out:
-                import shutil
-                shutil.copyfileobj(resp, out)
-
-        import zipfile, shutil
-        with zipfile.ZipFile(zip_path, "r") as z:
-            for member in z.infolist():
-                target = root / member.filename
-                if member.is_dir():
-                    target.mkdir(parents=True, exist_ok=True)
-                    try:
-                        target.chmod(0o755)
-                    except Exception:
-                        pass
-                else:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    with z.open(member) as s, open(target, "wb") as t:
-                        shutil.copyfileobj(s, t)
-                    try:
-                        target.chmod(0o644)
-                    except Exception:
-                        pass
-        if zip_path.name == "temp_data.zip" and zip_path.exists():
+        # 2. Try chmod -R 777 on Linux to unlock any 0000 mode directories
+        if os.name != "nt":
             try:
-                zip_path.unlink()
-            except OSError:
+                subprocess.run(["chmod", "-R", "777", str(root)], capture_output=True)
+            except Exception:
                 pass
-        return True
+            cand = glob.glob(str(harm_dir / "region=*" / "year=*" / "*.parquet"))
+            if cand:
+                _ensure_data_status = {"ok": True, "count": len(cand), "path": str(root)}
+                return True
+
+        # 3. Determine target extraction directory: if root is unwritable, fallback to /tmp
+        target_dir = root
+        can_write_root = False
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            test_file = root / ".write_test"
+            test_file.write_text("ok")
+            test_file.unlink()
+            can_write_root = True
+        except Exception:
+            pass
+
+        if not can_write_root:
+            target_dir = Path("/tmp/firecal_data/processed") if os.name != "nt" else root
+            target_dir.mkdir(parents=True, exist_ok=True)
+            settings.DATA_PROCESSED = str(target_dir)
+
+        # 4. Find or download processed_data.zip
+        zip_candidates = [
+            Path("/tmp/processed_data.zip"),
+            Path("data.zip"),
+            Path("processed_data.zip"),
+            root.parent / "data.zip",
+            root.parent / "processed_data.zip",
+        ]
+        zip_path = next((p for p in zip_candidates if p.exists() and p.stat().st_size > 10000), None)
+
+        if zip_path is None:
+            dl_path = Path("/tmp/processed_data.zip") if os.name != "nt" else Path("temp_data.zip")
+            url = "https://github.com/leon-pscl/4-bcc-nasa/releases/download/v1.0.0/processed_data.zip"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req) as resp, open(dl_path, "wb") as out:
+                shutil.copyfileobj(resp, out)
+            zip_path = dl_path
+
+        # 5. Extract all files into target_dir
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(str(target_dir))
+
+        if os.name != "nt":
+            try:
+                subprocess.run(["chmod", "-R", "777", str(target_dir)], capture_output=True)
+            except Exception:
+                pass
+
+        # 6. Verify partitions
+        harm_dir = target_dir / "harmonized_daily"
+        cand = glob.glob(str(harm_dir / "region=*" / "year=*" / "*.parquet"))
+        if cand:
+            settings.DATA_PROCESSED = str(target_dir)
+            _ensure_data_status = {"ok": True, "count": len(cand), "path": str(target_dir)}
+            return True
+        else:
+            _ensure_data_status = {"ok": False, "error": "extraction produced 0 partitions", "path": str(target_dir)}
+            return False
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("ensure_data error: %s", exc)
+        _ensure_data_status = {"ok": False, "error": str(exc)}
         return False
 
 
@@ -304,11 +332,11 @@ def create_app(settings=None, dist_dir=None):
         ok, detail = _probe_harmonized(settings)
         if ok:
             status = "stale" if stale else "ok"
-            body = {"status": status, "data_version": dv, "regions": regions}
+            body = {"status": status, "data_version": dv, "regions": regions, "ensure_status": _ensure_data_status}
         else:
             status = "error"
             body = {"status": status, "data_version": dv, "regions": regions,
-                    "error": detail}
+                    "error": detail, "ensure_status": _ensure_data_status}
         return _json_response(body, etag=dv)
 
     # ---------- API ----------
