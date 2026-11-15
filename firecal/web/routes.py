@@ -117,9 +117,21 @@ def _ensure_data(settings):
             with urllib.request.urlopen(req) as resp, open(dl_path, "wb") as out:
                 shutil.copyfileobj(resp, out)
 
-            # Extract into target_dir
+            # Extract cleanly into target_dir, normalizing any Windows backslashes
+            shutil.rmtree(str(target_dir), ignore_errors=True)
+            target_dir.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(dl_path, "r") as z:
-                z.extractall(str(target_dir))
+                for member in z.infolist():
+                    clean_name = member.filename.replace("\\", "/").strip("/")
+                    if not clean_name:
+                        continue
+                    target_path = target_dir / clean_name
+                    if member.is_dir() or member.filename.endswith("/") or member.filename.endswith("\\"):
+                        target_path.mkdir(parents=True, exist_ok=True)
+                    else:
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        with z.open(member) as source, open(target_path, "wb") as target:
+                            shutil.copyfileobj(source, target)
 
             if os.name != "nt":
                 try:
