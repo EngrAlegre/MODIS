@@ -35,10 +35,11 @@ def _probe_harmonized(settings):
     try:
         import glob
         from firecal.duck import connect
-        root = os.path.join(settings.DATA_PROCESSED, "harmonized_daily")
+        from firecal.dataset import processed_root
+        root = os.path.join(str(processed_root(settings)), "harmonized_daily")
         cand = glob.glob(os.path.join(root, "region=*", "year=*", "*.parquet"))
         if not cand:
-            return False, "no harmonized partitions found"
+            return False, f"no harmonized partitions found in {root}"
         def _y(p):
             try:
                 return int(os.path.basename(os.path.dirname(p)).split("=")[1])
@@ -367,6 +368,12 @@ def create_app(settings=None, dist_dir=None):
         from firecal.analytics.cover import cover_exists_latlon
         from firecal.analytics.export import (_series_days_relation, _area_where,
                                               _source_filters)
+        from firecal.dataset import dataset_dir
+        if not dataset_dir(settings, DETECTIONS).exists():
+            body = {"page": page, "page_size": page_size, "total": 0,
+                    "rows": [], "data_version": dv,
+                    "query": query_block(area, start, end, cover)}
+            return _json_response(body, etag=dv)
         from firecal.duck import connect
         con = connect(settings, "web")
         try:
