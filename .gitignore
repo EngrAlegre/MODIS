@@ -1,0 +1,49 @@
+# dependencies
+node_modules/
+frontend/node_modules/
+
+# build outputs
+dist/
+frontend/dist/
+*.tsbuildinfo
+
+# vite cache
+.vite/
+
+# environment
+.env
+.env.local
+.env.*.local
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# data
+data/raw/
+data/processed/
+data/synthetic/
+data/_quarantine/
+data/snapshots/
+data/*.log
+data/*.err
+
+# duckdb temp
+.tmp/
+*.tmp
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# editors / agents
+.claude/
+.vscode/
+.idea/
+
+# os
+.DS_Store
+Thumbs.db
